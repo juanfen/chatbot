@@ -1,0 +1,190 @@
+stages:
+  - build
+  - deploy
+
+# 通用变量（可在 GitLab CI/CD Variables 覆盖）
+variables:
+  # 需要满足 go.mod 的 go 版本要求（>= 1.24.3）
+  # 注意：为避免被 GitLab CI/CD Variables 同名键覆盖，build job 里已直接固定使用 golang:1.24.3
+  GOFLAGS: "-mod=mod"
+  GOPROXY: "https://goproxy.cn,direct"
+  GOMODCACHE: "$CI_PROJECT_DIR/.cache/gomod"
+  GOCACHE: "$CI_PROJECT_DIR/.cache/gocache"
+  APP_NAME: "xiaozhi-go-core"
+  APP_DIR: "main/xiaozhi-go-core"
+  BUILD_OUT: "dist/$APP_NAME"
+  # 默认部署目标（可在 GitLab CI/CD Variables 覆盖）
+  # 注意：这里填写主机/IP，不要带 http:// 前缀
+  DEPLOY_HOST: "153.35.238.82"
+  DEPLOY_PATH: "/home/command/go-core"
+
+default:
+  cache:
+    key: "${CI_PROJECT_NAME}-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - .cache/gomod/
+      - .cache/gocache/
+
+build:go-core:
+  stage: build
+  tags: ["chatbot"]
+  image:
+    name: "golang:1.24.3"
+    pull_policy: if-not-present
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+  script:
+    - go env
+    # go-core 侧 Opus 编解码通常依赖系统库（cgo + libopus/libopusfile/libogg + pkg-config）
+    - apt-get update -y
+    - apt-get install -y --no-install-recommends pkg-config libopus-dev libopusfile-dev libogg-dev ca-certificates
+    - mkdir -p dist
+    - cd "$APP_DIR"
+    - go test ./...
+    - CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o "$CI_PROJECT_DIR/$BUILD_OUT" ./cmd/server/
+    - cd "$CI_PROJECT_DIR"
+    # 采集运行库：与 build-linux-dist.sh 一致，打包 libopus/libopusfile/libogg 到 dist/lib
+    - mkdir -p dist/lib
+    - |
+      ldd "$BUILD_OUT" \
+        | awk '/=> \// && ($1 ~ /libopus|libopusfile|libogg/) {print $3}' \
+        | while read -r lib; do cp -L "$lib" dist/lib/; done
+    - 'test -f "dist/lib/libopus.so.0" || (echo "ERROR: missing dist/lib/libopus.so.0" && exit 7)'
+    - 'test -f "dist/lib/libopusfile.so.0" || (echo "ERROR: missing dist/lib/libopusfile.so.0" && exit 8)'
+    - 'test -f "dist/lib/libogg.so.0" || (echo "ERROR: missing dist/lib/libogg.so.0" && exit 9)'
+    # 打包：强制携带 config 与多实例启停脚本，避免线上缺文件
+    - 'test -f "$APP_DIR/config.json" || (echo "ERROR: missing required file: $APP_DIR/config.json" && exit 2)'
+    - 'test -f "$APP_DIR/run_multi_go_core_instances.sh" || (echo "ERROR: missing required file: $APP_DIR/run_multi_go_core_instances.sh" && exit 2)'
+    - 'test -f "$APP_DIR/stop_multi_go_core_instances.sh" || (echo "ERROR: missing required file: $APP_DIR/stop_multi_go_core_instances.sh" && exit 2)'
+    - tar -czf "dist/${APP_NAME}-${CI_COMMIT_SHORT_SHA}.tgz" "$BUILD_OUT" "dist/lib" "$APP_DIR/config.json" "$APP_DIR/run_multi_go_core_instances.sh" "$APP_DIR/stop_multi_go_core_instances.sh"
+  artifacts:
+    expire_in: 7 days
+    when: always
+    paths:
+      - "dist/${APP_NAME}-${CI_COMMIT_SHORT_SHA}.tgz"
+
+deploy:prod:
+  stage: deploy
+  tags: ["chatbot"]
+  image:
+    name: alpine:3.20
+    pull_policy: if-not-present
+  needs:
+    - job: build:go-core
+      artifacts: true
+  rules:
+    # 所有分支与 tag 都自动触发部署
+    - if: '$CI_COMMIT_BRANCH'
+      when: on_success
+    - if: '$CI_COMMIT_TAG'
+      when: on_success
+  before_script:
+    - apk add --no-cache openssh-client rsync bash
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    # 私钥加载优先级：
+    # 1) SSH_PRIVATE_KEY_B64（推荐，base64 单行，最不容易被变量格式破坏）
+    # 2) SSH_PRIVATE_KEY 为 File 类型变量（值是文件路径）
+    # 3) SSH_PRIVATE_KEY 为普通变量（值是私钥内容）
+    - |
+      if [ -n "${SSH_PRIVATE_KEY_B64:-}" ]; then
+        echo "$SSH_PRIVATE_KEY_B64" | tr -d '\r\n ' | base64 -d > ~/.ssh/id_rsa
+      elif [ -f "${SSH_PRIVATE_KEY:-}" ]; then
+        tr -d '\r' < "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+      else
+        echo "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_rsa
+      fi
+    - chmod 600 ~/.ssh/id_rsa
+    - |
+      ssh-keygen -y -f ~/.ssh/id_rsa >/dev/null 2>&1 || (
+        echo "ERROR: SSH private key is invalid/unreadable."
+        echo "HINT: use SSH_PRIVATE_KEY_B64 (base64-encoded private key), or ensure SSH_PRIVATE_KEY is raw private key content."
+        exit 10
+      )
+    # 可选：提供 SSH_KNOWN_HOSTS；否则禁用严格校验（不推荐，但便于快速落地）
+    - |
+      if [ -n "${SSH_KNOWN_HOSTS:-}" ]; then
+        echo "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+        chmod 644 ~/.ssh/known_hosts
+      else
+        printf "Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile=/dev/null\n" > ~/.ssh/config
+        chmod 600 ~/.ssh/config
+      fi
+  script: |
+    set -euo pipefail
+
+    # 必填变量：
+    # - DEPLOY_HOST: 线上服务器 IP/域名
+    # - DEPLOY_USER: 登录用户
+    # - DEPLOY_PATH: 部署目录（例如 /home/command/go-core）
+    test -n "${DEPLOY_HOST:-}" || (echo "missing DEPLOY_HOST" && exit 1)
+    test -n "${DEPLOY_USER:-}" || (echo "missing DEPLOY_USER" && exit 1)
+    test -n "${DEPLOY_PATH:-}" || (echo "missing DEPLOY_PATH" && exit 1)
+
+    PKG="dist/${APP_NAME}-${CI_COMMIT_SHORT_SHA}.tgz"
+    test -f "$PKG" || (echo "package not found: $PKG" && exit 1)
+
+    # 先验证 SSH 认证，避免 rsync/远程脚本阶段才报错
+    ssh -o BatchMode=yes -o IdentitiesOnly=yes "${DEPLOY_USER}@${DEPLOY_HOST}" "echo 'ssh auth ok'"
+
+    echo "Upload package to ${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}"
+    ssh -o IdentitiesOnly=yes "${DEPLOY_USER}@${DEPLOY_HOST}" "mkdir -p '${DEPLOY_PATH}/releases' '${DEPLOY_PATH}/current'"
+    rsync -avz -e "ssh -o IdentitiesOnly=yes" "$PKG" "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/releases/"
+
+    # 分发覆盖：解压后把二进制、配置、启停脚本覆盖到 ${DEPLOY_PATH}/current/
+    ssh -o IdentitiesOnly=yes "${DEPLOY_USER}@${DEPLOY_HOST}" \
+      "DEPLOY_PATH='${DEPLOY_PATH}' APP_NAME='${APP_NAME}' CI_SHORT_SHA='${CI_COMMIT_SHORT_SHA}' bash -s" <<'EOSSH'
+      set -euo pipefail
+      cd "${DEPLOY_PATH}"
+      rel="releases/${APP_NAME}-${CI_SHORT_SHA}.tgz"
+      work="releases/.unpack_${APP_NAME}_${CI_SHORT_SHA}"
+      rm -rf "${work}"
+      mkdir -p "${work}"
+      tar -xzf "${rel}" -C "${work}"
+
+      # 兼容打包时带路径前缀（dist/...、main/...）的情况
+      if [ -f "${work}/dist/${APP_NAME}" ]; then
+        mv -f "${work}/dist/${APP_NAME}" "${work}/${APP_NAME}"
+      fi
+      if [ -f "${work}/main/xiaozhi-go-core/config.json" ]; then
+        mv -f "${work}/main/xiaozhi-go-core/config.json" "${work}/config.json"
+      fi
+      if [ -f "${work}/main/xiaozhi-go-core/run_multi_go_core_instances.sh" ]; then
+        mv -f "${work}/main/xiaozhi-go-core/run_multi_go_core_instances.sh" "${work}/run_multi_go_core_instances.sh"
+      fi
+      if [ -f "${work}/main/xiaozhi-go-core/stop_multi_go_core_instances.sh" ]; then
+        mv -f "${work}/main/xiaozhi-go-core/stop_multi_go_core_instances.sh" "${work}/stop_multi_go_core_instances.sh"
+      fi
+      if [ -d "${work}/dist/lib" ]; then
+        mv -f "${work}/dist/lib" "${work}/lib"
+      fi
+
+      test -f "${work}/${APP_NAME}" || (echo 'missing binary in package' && exit 3)
+      test -f "${work}/run_multi_go_core_instances.sh" || (echo 'missing run_multi_go_core_instances.sh in package' && exit 5)
+      test -f "${work}/stop_multi_go_core_instances.sh" || (echo 'missing stop_multi_go_core_instances.sh in package' && exit 6)
+      test -f "${work}/lib/libopus.so.0" || (echo 'missing lib/libopus.so.0 in package' && exit 11)
+      test -f "${work}/lib/libopusfile.so.0" || (echo 'missing lib/libopusfile.so.0 in package' && exit 12)
+      test -f "${work}/lib/libogg.so.0" || (echo 'missing lib/libogg.so.0 in package' && exit 13)
+
+      install -m 755 "${work}/${APP_NAME}" "current/${APP_NAME}"
+      test -f "${work}/config.json" || (echo 'missing config.json in package' && exit 4)
+      install -m 644 "${work}/config.json" "current/config.json"
+      install -m 755 "${work}/run_multi_go_core_instances.sh" "current/run_multi_go_core_instances.sh"
+      install -m 755 "${work}/stop_multi_go_core_instances.sh" "current/stop_multi_go_core_instances.sh"
+      rm -rf current/lib
+      mkdir -p current/lib
+      cp -a "${work}/lib/." current/lib/
+      echo 'Config overwritten: current/config.json'
+
+      # 解压成功后自动：先停再起
+      cd current
+      ./stop_multi_go_core_instances.sh 4 8000 19100 19090 || true
+      TTS_ROUTE_MODE=dedicated ./run_multi_go_core_instances.sh 4 8000 19100 19090
+
+      rm -rf "${work}"
+      echo 'Deploy done (files overwritten in current/).'
+    EOSSH
+  environment:
+    name: production
+

@@ -1,0 +1,43 @@
+# chatbot-base: xiaozhi-server 的基础运行时镜像（Python3.10 + 系统依赖 + Python依赖）
+#
+# 在仓库根目录执行：
+# docker build -t chatbot-base:latest -f main/Dockerfile.base main
+
+ARG BASE_IMAGE=python:3.10.16-slim-bullseye
+FROM ${BASE_IMAGE}
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+ARG APT_MIRROR=mirrors.aliyun.com
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+
+RUN apt-get update \
+    && sed -i "s|deb.debian.org|${APT_MIRROR}|g; s|security.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY xiaozhi-server/requirements.txt /tmp/requirements.txt
+RUN python3 - <<'PY'
+from pathlib import Path
+
+req = Path("/tmp/requirements.txt")
+text = req.read_text(encoding="utf-8")
+# Python 3.10 下 sherpa_onnx==1.12.17 无可用发行包，构建时替换为可安装版本
+text = text.replace("sherpa_onnx==1.12.17", "sherpa_onnx==1.12.39")
+# grpcio-tools 1.80.0 依赖 protobuf>=6.31.1，与 mem0ai(要求 protobuf<6) 冲突
+# 在不改仓库原始 requirements 的前提下，构建时降级到与 protobuf 5 兼容的版本
+text = text.replace("grpcio==1.80.0", "grpcio==1.67.1")
+text = text.replace("grpcio-tools==1.80.0", "grpcio-tools==1.67.1")
+req.write_text(text, encoding="utf-8")
+PY
+
+RUN pip install --upgrade pip \
+    && pip install -i "${PIP_INDEX_URL}" --trusted-host "$(echo "${PIP_INDEX_URL}" | awk -F/ '{print $3}')" -r /tmp/requirements.txt

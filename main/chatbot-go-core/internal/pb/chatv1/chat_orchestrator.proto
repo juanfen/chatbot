@@ -1,0 +1,172 @@
+syntax = "proto3";
+
+package xiaozhi.chat.v1;
+
+option go_package = "xiaozhi-go-core/internal/pb/chatv1;chatv1";
+
+enum StreamEvent {
+  STREAM_EVENT_UNSPECIFIED = 0;
+  STREAM_EVENT_CONTENT_CHUNK = 1;
+  STREAM_EVENT_TOOL_CALL = 2;
+  STREAM_EVENT_FINISH = 3;
+  STREAM_EVENT_ERROR = 4;
+  STREAM_EVENT_TTS_START = 5;
+  STREAM_EVENT_AUDIO_CHUNK = 6;
+  STREAM_EVENT_TTS_END = 7;
+  STREAM_EVENT_TTS_ERROR = 8;
+}
+
+enum VoiceRequestType {
+  VOICE_REQUEST_TYPE_UNSPECIFIED = 0;
+  VOICE_REQUEST_TYPE_START = 1;
+  VOICE_REQUEST_TYPE_AUDIO = 2;
+  VOICE_REQUEST_TYPE_CONTEXT_UPDATE = 3;
+  VOICE_REQUEST_TYPE_TOOL_RESULT = 4;
+  VOICE_REQUEST_TYPE_ABORT = 5;
+  VOICE_REQUEST_TYPE_RESET = 6;
+  VOICE_REQUEST_TYPE_END = 7;
+}
+
+enum VoiceEvent {
+  VOICE_EVENT_UNSPECIFIED = 0;
+  VOICE_EVENT_VAD_SPEECH_START = 1;
+  VOICE_EVENT_VAD_SPEECH_END = 2;
+  VOICE_EVENT_ASR_TRANSCRIPT = 3;
+  VOICE_EVENT_VOICEPRINT_RESULT = 4;
+  VOICE_EVENT_CONTENT_CHUNK = 5;
+  VOICE_EVENT_TOOL_CALL = 6;
+  VOICE_EVENT_FINISH = 7;
+  VOICE_EVENT_ERROR = 8;
+  VOICE_EVENT_TTS_START = 9;
+  VOICE_EVENT_AUDIO_CHUNK = 10;
+  VOICE_EVENT_TTS_END = 11;
+  VOICE_EVENT_TTS_ERROR = 12;
+}
+
+enum ToolAction {
+  TOOL_ACTION_UNSPECIFIED = 0;
+  TOOL_ACTION_RESPONSE = 1;
+  TOOL_ACTION_REQLLM = 2;
+  TOOL_ACTION_ERROR = 3;
+  TOOL_ACTION_NOTFOUND = 4;
+}
+
+message StreamChatRequest {
+  string session_id = 1;
+  string request_id = 2;
+  string device_id = 3;
+  string client_id = 4;
+  string query = 5;
+  string intent_type = 6;
+  int32 max_output_size = 7;
+  repeated Message messages = 8;
+  bool voiceprint_enabled = 9;
+  string metadata_json = 10;
+}
+
+message Message {
+  string role = 1;
+  string content = 2;
+  string tool_call_id = 3;
+  bool is_temporary = 4;
+  repeated ToolCall tool_calls = 5;
+}
+
+message ToolCall {
+  string id = 1;
+  string name = 2;
+  string arguments_json = 3;
+}
+
+message StreamChatResponse {
+  StreamEvent event = 1;
+  string content_chunk = 2;
+  ToolCall tool_call = 3;
+  string finish_reason = 4;
+  string error_code = 5;
+  string error_message = 6;
+
+  string tts_stream_id = 7;
+  uint64 chunk_seq = 8;
+  bool is_last_chunk = 9;
+  string codec = 10;
+  uint32 sample_rate_hz = 11;
+  uint32 channels = 12;
+  uint32 frame_duration_ms = 13;
+  bytes audio_chunk = 14;
+}
+
+message VoiceStreamRequest {
+  VoiceRequestType type = 1;
+  string session_id = 2;
+  string request_id = 3;
+  string device_id = 4;
+  string client_id = 5;
+  uint64 frame_seq = 6;
+  string codec = 7;
+  uint32 sample_rate_hz = 8;
+  uint32 channels = 9;
+  uint32 frame_duration_ms = 10;
+  bytes audio_frame = 11;
+  string listen_mode = 12;
+  bool client_is_speaking = 13;
+  int32 max_output_size = 14;
+  bool voiceprint_enabled = 15;
+  repeated Message messages = 16;
+  string metadata_json = 17;
+  string tool_call_id = 18;
+  string tool_name = 19;
+  string tool_result = 20;
+}
+
+message VoiceStreamResponse {
+  VoiceEvent event = 1;
+  string session_id = 2;
+  string request_id = 3;
+  uint64 frame_seq = 4;
+  string transcript = 5;
+  string speaker = 6;
+  string content_chunk = 7;
+  ToolCall tool_call = 8;
+  string finish_reason = 9;
+  string error_code = 10;
+  string error_message = 11;
+  string tts_stream_id = 12;
+  uint64 chunk_seq = 13;
+  bool is_last_chunk = 14;
+  string codec = 15;
+  uint32 sample_rate_hz = 16;
+  uint32 channels = 17;
+  uint32 frame_duration_ms = 18;
+  bytes audio_chunk = 19;
+}
+
+message ExecuteToolRequest {
+  string session_id = 1;
+  string request_id = 2;
+  string device_id = 3;
+  string client_id = 4;
+  string tool_name = 5;
+  string arguments_json = 6;
+  string metadata_json = 7;
+}
+
+message ExecuteToolResponse {
+  ToolAction action = 1;
+  string result = 2;
+  string response = 3;
+  string error_code = 4;
+  string error_message = 5;
+}
+
+service ChatOrchestratorService {
+  rpc StreamChat(StreamChatRequest) returns (stream StreamChatResponse);
+}
+
+service ToolExecutionService {
+  rpc ExecuteTool(ExecuteToolRequest) returns (ExecuteToolResponse);
+}
+
+service VoicePipelineService {
+  rpc StreamVoice(stream VoiceStreamRequest) returns (stream VoiceStreamResponse);
+}
